@@ -31,7 +31,10 @@ MOCK_MODULES = ['GPy',
                 'scipy',
                 'scipy.interpolate',
                 'scipy.spatial',
-                'scipy.spatial.distance']
+                'scipy.spatial.distance',
+                'scipy.special',
+                'scipy.stats',
+                ]
 
 for mod_name in MOCK_MODULES:
     sys.modules[mod_name] = mock.Mock()
@@ -57,6 +60,11 @@ extensions = [
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['']
+
+# Generate an autosummary with one file per function.
+autosummary_generate = True
+
+autodoc_default_flags = []
 
 # The suffix(es) of source filenames.
 # You can specify multiple suffix as a list of string:

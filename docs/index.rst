@@ -12,11 +12,7 @@ Welcome to SafeOpt's documentation!
    :caption: Contents
    :maxdepth: 3
 
-.. automodule:: safeopt
-   :members:
-   :inherited-members:
-   :undoc-members:
-   :show-inheritance:
+   api
 
 Indices and tables
 ==================
