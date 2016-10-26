@@ -70,7 +70,7 @@ class GaussianProcessOptimization(object):
         if scaling == 'auto':
             dummy_point = np.zeros((1, self.gps[0].input_dim))
             self.scaling = [gp.kern.Kdiag(dummy_point)[0] for gp in self.gps]
-            self.scaling = np.asarray(self.scaling)
+            self.scaling = np.sqrt(np.asarray(self.scaling))
         else:
             self.scaling = np.asarray(scaling)
             if self.scaling.shape[0] != len(self.gps):
@@ -604,7 +604,8 @@ class SafeOpt(GaussianProcessOptimization):
 class SafeOptSwarm(GaussianProcessOptimization):
     """SafeOpt for larger dimensions using a Swarm Optimization heuristic.
 
-    Note that it doesn't support the use of a Lipschitz constant
+    Note that it doesn't support the use of a Lipschitz constant nor contextual
+    optimization.
 
     You can set your logging level to INFO to get more insights on the
     optimization process.
@@ -635,11 +636,33 @@ class SafeOptSwarm(GaussianProcessOptimization):
     swarm_size: int
         The number of particles in each of the optimization swarms
 
+    Examples
+    --------
+    >>> from safeopt import SafeOptSwarm
+    >>> import GPy
+    >>> import numpy as np
+
+    Define a Gaussian process prior over the performance
+
+    >>> x = np.array([[0.]])
+    >>> y = np.array([[1.]])
+    >>> gp = GPy.models.GPRegression(1, x, y)
+
+    Initialize the Bayesian optimization and get new parameters to evaluate
+
+    >>> opt = SafeOptSwarm(gp, fmin=[0.], bounds=[[-1., 1.]])
+    >>> next_parameters = opt.optimize()
+
+    Add a new data point with the parameters and the performance to the GP.
+
+    >>> opt.add_new_data_point(next_parameters, performance)
+
     """
 
-    def __init__(self, gp, fmin, bounds, beta=3.0, num_contexts=0,
-                 scaling='auto', swarm_size=20):
-        super(SafeOptSwarm, self).__init__(gp, beta, num_contexts, scaling)
+    def __init__(self, gp, fmin, bounds, beta=3.0, scaling='auto',
+                 swarm_size=20):
+        super(SafeOptSwarm, self).__init__(gp, beta, num_contexts=0,
+                                           scaling=scaling)
 
         self.fmin = fmin
         if not isinstance(self.fmin, list):
@@ -656,22 +679,82 @@ class SafeOptSwarm(GaussianProcessOptimization):
         else:
             self.bounds = bounds
 
-        self.var_max = gp.kern.Kdiag(gp.X[[-1], :])
-
         # These are estimates of the best lower bound, and its location
         self.best_lower_bound = -np.inf
         self.greedy_point = self.S[0, :]
 
-    def _compute_penalty(self, slack, scaling):
+        self.optimal_velocities = self.optimize_particle_velocity()
+
+    def optimize_particle_velocity(self):
+        """Optimize the velocities of the particles.
+
+        Note that this only works well for stationary kernels and constant mean
+        functions. Otherwise the velocity depends on the position!
+
+        Returns
+        -------
+        velocities: ndarray
+            The estimated optimal velocities in each direction.
         """
-        Return the penalty associated to a constraint violation
+        parameters = np.zeros((1, self.gp.input_dim), dtype=np.float)
+        velocities = np.empty((len(self.gps), self.gp.input_dim),
+                              dtype=np.float)
+
+        for i, gp in enumerate(self.gps):
+            for j in range(self.gp.input_dim):
+                tmp_velocities = np.zeros((1, self.gp.input_dim),
+                                          dtype=np.float)
+
+                # lower and upper bounds on velocities
+                upper_velocity = 1000.
+                lower_velocity = 0.
+
+                # Binary search over optimal velocities
+                while True:
+                    mid = (upper_velocity + lower_velocity) / 2
+                    tmp_velocities[0, j] = mid
+
+                    kernel_matrix = gp.kern.K(parameters, tmp_velocities)
+                    covariance = kernel_matrix.squeeze() / self.scaling[i] ** 2
+
+                    # Make sure the correlation is in the sweet spot
+                    velocity_enough = covariance > 0.94
+                    not_too_fast = covariance < 0.95
+
+                    if not_too_fast:
+                        upper_velocity = mid
+                    elif velocity_enough:
+                        lower_velocity = mid
+
+                    if ((not_too_fast and velocity_enough) or
+                            upper_velocity - lower_velocity < 1e-5):
+                        break
+
+                # Store optimal velocity
+                velocities[i, j] = mid
+
+        # Select the minimal velocity (for the toughest safety constraint)
+        velocities = np.min(velocities, axis=0)
+
+        # Scale for number of parameters (this might not be so clever if they
+        # are all independent, additive kernels).
+        velocities /= np.sqrt(self.gp.input_dim)
+        return velocities
+
+    def _compute_penalty(self, slack, scaling):
+        """Return the penalty associated to a constraint violation.
+
+        The penalty is a piecewise linear function that is nonzero only if the
+        safety constraints are violated. This penalty encourages particles to
+        stay within the safe set.
 
         Parameters
         ----------
         slack: ndarray
-            A vector corresponding to how much the constraint was violated
+            A vector corresponding to how much the constraint was violated.
         scaling: float
-            A float corresponding to the maximal variance of the corresponding GP
+            A float corresponding to the maximal variance of the corresponding
+            GP
         Returns
         -------
         penalties - ndarray
@@ -693,27 +776,27 @@ class SafeOptSwarm(GaussianProcessOptimization):
 
         Parameters
         ----------
-        particles: ndarray
+        particles : ndarray
             A vector containing the coordinates of the particles
-        swarm_type: string
+        swarm_type : string
             A string corresponding to the swarm type. It can be any of the
-            following:
-                - "greedy" : estimate of the best lower bound
-                - "expander" : find expender points
-                - "maximizer" : find maximizer points
-                - "safe_set" : special parameter to check only safety
+            following strings:
+                * 'greedy' : Optimal value(best lower bound).
+                * 'expander' : Expanders (lower bound close to constraint)
+                * 'maximizer' : Maximizers (Upper bound better than best l)
+                * 'safe_set' : Only check the safety of the particles
         Returns
         -------
-        values - ndarray
+        values : ndarray
             The values of the particles
-        global_safe - ndarray
+        global_safe : ndarray
             A boolean mask indicating safety status of all particles
             (note that in the case of a greedy swarm, this is not computed and
             we return a True mask)
         """
         beta = self.beta(self.t)
 
-        # classify the particles points
+        # classify the particle's function values
         mean, var = self.gps[0].predict_noiseless(particles)
         mean = mean.squeeze()
         std_dev = np.sqrt(var.squeeze())
@@ -724,61 +807,74 @@ class SafeOptSwarm(GaussianProcessOptimization):
 
         # the greedy swarm optimizes for the lower bound
         if swarm_type == 'greedy':
-            return lower_bound, np.ones(lower_bound.shape[0], dtype=np.bool)
+            return lower_bound, np.broadcast_to(True, len(lower_bound))
 
         # value we are optimizing for. Expanders and maximizers seek high
         # variance points
         values = std_dev / self.scaling[0]
 
-        # define the interest function based on the particle type
-        if swarm_type == 'maximizers':
-            interest_function = expit(upper_bound - self.best_lower_bound)
-        elif swarm_type == 'expanders' or swarm_type == 'safe_set':
-            interest_function = np.ones(np.shape(values))
+        #
+        is_safe = swarm_type == 'safe_set'
+        is_expander = swarm_type == 'expanders'
+        is_maximizer = swarm_type == 'maximizers'
+
+        if is_safe:
+            interest_function = None
         else:
-            # unknown particle type (shouldn't happen)
-            raise AssertionError("Invalid swarm type")
+            if is_expander:
+                # For expanders, the interest function is updated depending on
+                # the lower bounds
+                interest_function = np.ones(np.shape(values), dtype=np.float)
+            elif is_maximizer:
+                interest_function = expit(upper_bound - self.best_lower_bound)
+            else:
+                # unknown particle type (shouldn't happen)
+                raise AssertionError("Invalid swarm type")
 
         # boolean mask that tell if the particles are safe according to all gps
         global_safe = np.ones(particles.shape[0], dtype=np.bool)
-        total_penalty = np.zeros(particles.shape[0])
+        total_penalty = np.zeros(particles.shape[0], dtype=np.float)
+
         for i, (gp, scaling) in enumerate(zip(self.gps, self.scaling)):
-            if i == 0:
-                cur_lower_bound = lower_bound  # reuse computation
-            else:
+            # Only recompute confidence intervals for constraints
+            if i > 0:
                 # classify using the current GP
-                cur_mean, cur_var = gp.predict_noiseless(particles)
-                cur_mean = cur_mean.squeeze()
-                cur_std_dev = np.sqrt(cur_var.squeeze())
-                cur_lower_bound = cur_mean - beta * cur_std_dev
-                values = np.maximum(values, cur_std_dev / scaling)
+                mean, var = gp.predict_noiseless(particles)
+                mean = mean.squeeze()
+                std_dev = np.sqrt(var.squeeze())
+                lower_bound = mean - beta * std_dev
+
+                values = np.maximum(values, std_dev / scaling)
 
             # if the current GP has no safety constrain, we skip it
             if self.fmin[i] == -np.inf:
                 continue
 
-            slack = np.atleast_1d(cur_lower_bound - self.fmin[i])
+            slack = np.atleast_1d(lower_bound - self.fmin[i])
 
             # computing penalties
             global_safe &= slack >= 0
 
+            # Skip cost update for safety evaluation
+            if is_safe:
+                continue
+
             total_penalty += self._compute_penalty(slack, scaling)
 
-            if swarm_type == 'expanders':
+            if is_expander:
                 # check if the particles are expanders for the current gp
-                interest_function *= norm.pdf(cur_lower_bound,
-                                              loc=self.fmin[i])
+                interest_function *= norm.pdf(lower_bound, loc=self.fmin[i])
+
+        # this swarm type is only interested in knowing whether the particles
+        # are safe.
+        if is_safe:
+            return lower_bound, global_safe
 
         # add penalty
         values += total_penalty
 
         # apply the mask for current interest function
         values *= interest_function
-
-        # this swarm type is only interested in knowing whether the particles
-        # are safe.
-        if swarm_type == 'safe_set':
-            values = lower_bound
 
         return values, global_safe
 
@@ -792,14 +888,13 @@ class SafeOptSwarm(GaussianProcessOptimization):
         Parameters
         ----------
         swarm_type: string
-            This parameter controls the type of point that should be found.
-              -If set to "expanders", it will try to find a point that
-               increases the safe set
-              -If set to "maximizers", it will try to find a point that
-               maximizes the objective function within the safe set
-              -"Greedy" is a convenience parameter to retrieve an estimate of
-               the best currently known point, given the observations already
-               made.
+            This parameter controls the type of point that should be found. It
+            can take one of the following values
+                * 'expanders' : find a point that increases the safe set
+                * 'maximizers' : find a point that maximizes the objective
+                                 function within the safe set.
+                * 'greedy' : retrieve an estimate of the best currently known
+                             parameters (best lower bound).
 
         Returns
         -------
@@ -815,23 +910,21 @@ class SafeOptSwarm(GaussianProcessOptimization):
         # Parameters of PSO
         c1 = 2  # coefficient of the regret term
         c2 = 2  # coefficient of the social term
-        inertia_beginning = 1.2  # Inertia term at the beginning of optimization
-        inertia_end = 0.1  # Inertia term at the end of optimization
 
         # Make sure the safe set is still safe
-        lower_bound, safe = self._compute_particle_fitness(self.S, 'safe_set')
-        unsafe = np.logical_not(safe)
+        _, safe = self._compute_particle_fitness(self.S, 'safe_set')
+
         if not np.all(safe):
+            # Warn that the safe set has decreased
             logging.warning("Warning: {} unsafe points removed. "
                             "Model might be violated"
-                            .format(np.count_nonzero(unsafe)))
-            try:
-                self.S = self.S[safe]
-                safe_size = self.S.shape[0]
-            except:
-                pass
+                            .format(np.count_nonzero(~safe)))
 
-        # init particles
+            # Remove unsafe points
+            self.S = self.S[safe]
+            safe_size = self.S.shape[0]
+
+        # initialize particles
         if swarm_type == 'greedy':
             # we pick particles u.a.r in the safe set
             random_id = np.random.randint(safe_size, size=self.swarm_size - 3)
@@ -843,77 +936,54 @@ class SafeOptSwarm(GaussianProcessOptimization):
             # - best sampled point
             particles = np.vstack((self.S[random_id, :],
                                    self.greedy_point,
-                                   self.gp.X[[-1], :],
-                                   self.gp.X[[best_sampled_point]]))
+                                   self.gp.X[-1, :],
+                                   self.gp.X[best_sampled_point]))
         else:
             # we pick particles u.a.r in the safe set
             random_id = np.random.randint(safe_size, size=self.swarm_size)
             particles = self.S[random_id, :]
-
-        # we now find a velocity that gets us away from the current points, but
-        # that doesn't get too far (ie we seek points that still highly
-        # correlated)
-        # the following is a binary search
-        velocity_found = False
-        current_coef_up = 1000.
-        current_coef_down = 0.
-
-        random_velocity = np.random.rand(self.swarm_size, input_dim)
-        while not velocity_found:
-            mid = (current_coef_up + current_coef_down) / 2
-            velocities = mid * random_velocity
-
-            # simulate one step of movement
-            tmp_particles = inertia_beginning * velocities + particles
-            for cur_dim in range(input_dim):
-                tmp_particles[:, cur_dim] = np.clip(tmp_particles[:, cur_dim],
-                                                    self.bounds[cur_dim][0],
-                                                    self.bounds[cur_dim][1])
-
-            # compute correlation with current safe set.
-            # TODO maybe make this dependent on all the kernels
-            kernel_matrix = (self.gps[0].kern.K(tmp_particles, self.S) /
-                             self.scaling[0])
-            closest = np.max(kernel_matrix, axis=1)
-            # make sure that the velocity is not too big (takes us out of safe
-            # set)
-            velocity_reasonable = np.min(closest) >= 0.9
-            # make sure that the velocity is big enough (for exploration
-            # purposes)
-            velocity_enough = np.max(closest) <= 0.98
-            velocity_found = ((velocity_reasonable and velocity_enough) or
-                              abs(current_coef_down - current_coef_up) < 0.001)
-
-            if velocity_enough:
-                current_coef_up = mid
-            else:
-                current_coef_down = mid
 
         # compute initial fitness
         best_value, safe = self._compute_particle_fitness(
             particles, swarm_type)
 
         # initialization of the best estimates
-        best_position = particles.copy()
-        global_best = best_position[np.argmax(best_value), :]
+        best_positions = particles.copy()
+        global_best = best_positions[np.argmax(best_value), :]
 
-        inertia_coef = (inertia_end - inertia_beginning) / self.max_iters
+        # Get a random initial velocity
+        velocities = (np.random.rand(self.swarm_size, input_dim) *
+                      self.optimal_velocities)
+
+        # Initial inertia of particles changes over iterations
+        inertia = 1.0
+        final_inertia = 0.1
+        max_velocity = 10 * self.optimal_velocities
+
+        inertia_step = (final_inertia - inertia) / self.max_iters
+        inertia -= inertia_step
+
+        # run the core swarm optimization
         for i in range(self.max_iters):
             # update velocities
             delta_global_best = global_best - particles
-            delta_self_best = best_position - particles
-            inertia = i * inertia_coef + inertia_beginning
+            delta_self_best = best_positions - particles
 
+            inertia += inertia_step
+
+            # Random update vectors
             r = np.random.rand(2 * self.swarm_size, input_dim)
             r1 = r[:self.swarm_size]
             r2 = r[self.swarm_size:]
 
+            # Update the velocities
             velocities *= inertia
             velocities += (c1 * r1 * delta_self_best +
                            c2 * r2 * delta_global_best)
 
             # clip
-            np.clip(velocities, -4, 4, out=velocities)
+            # np.clip(velocities, -4, 4, out=velocities)
+            np.clip(velocities, -max_velocity, max_velocity, out=velocities)
 
             # update position
             particles += velocities
@@ -933,21 +1003,21 @@ class SafeOptSwarm(GaussianProcessOptimization):
             update_set &= safe
 
             best_value[update_set] = values[update_set]
-            best_position[update_set] = particles[update_set]
-            global_best = best_position[np.argmax(best_value), :]
+            best_positions[update_set] = particles[update_set]
+            global_best = best_positions[np.argmax(best_value), :]
 
         # expand safe set
         if swarm_type != 'greedy':
             selected_point_id = np.argmax(best_value)
-            append = 0
+            num_added = 0
 
             # compute correlation between new candidates and current safe set
-            mat = self.gp.kern.K(best_position,
-                                 np.append(self.S, best_position, axis=0))
-            mat /= self.scaling[0]
+            covariance = self.gp.kern.K(best_positions,
+                                        np.vstack((self.S, best_positions)))
+            covariance /= self.scaling[0] ** 2
 
-            initial_safe = self.S.shape[0]
-            n, m = np.shape(mat)
+            initial_safe = len(self.S)
+            n, m = np.shape(covariance)
 
             # this mask keeps track of the points that we have added in the
             # safe set to account for them when adding a new point
@@ -956,23 +1026,23 @@ class SafeOptSwarm(GaussianProcessOptimization):
 
             for j in range(n):
                 # make sure correlation with old points is relatively low
-                good_correlation = np.all(mat[j, mask] <= 0.95)
+                good_correlation = np.all(covariance[j, mask] <= 0.95)
                 # Note that we force addition of the highest variance point
                 if j == selected_point_id or good_correlation:
-                    self.S = np.append(self.S, best_position[[j], :], axis=0)
-                    append += 1
+                    self.S = np.vstack((self.S, best_positions[[j], :]))
+                    num_added += 1
                     mask[initial_safe + j] = True
 
-            logging.info("At the end of swarm {}, {} points were appended to"
-                         " safeset".format(swarm_type, append))
+            logging.debug("At the end of swarm {}, {} points were appended to"
+                          " the safeset".format(swarm_type, num_added))
         else:
             # check whether we found a better estimate of the lower bound
-            mean, var = self.gps[0].predict_noiseless(
-                np.atleast_2d(self.greedy_point))
+            mean, var = self.gp.predict_noiseless(self.greedy_point[None, :])
             mean = mean.squeeze()
             std_dev = np.sqrt(var.squeeze())
-            lower_bound1 = mean - beta * std_dev
-            if lower_bound1 < np.max(best_value):
+
+            lower_bound = mean - beta * std_dev
+            if lower_bound < np.max(best_value):
                 self.greedy_point = global_best
 
         if swarm_type == 'greedy':
@@ -981,7 +1051,7 @@ class SafeOptSwarm(GaussianProcessOptimization):
         # compute the variance of the point picked
         max_std_dev = 0.
         for gp, scaling in zip(self.gps, self.scaling):
-            var = gp.predict_noiseless(np.atleast_2d(global_best))[1]
+            var = gp.predict_noiseless(global_best[None, :])[1]
             max_std_dev = np.max(np.sqrt(var.squeeze()) / scaling, max_std_dev)
 
         return global_best, max_std_dev
@@ -999,13 +1069,10 @@ class SafeOptSwarm(GaussianProcessOptimization):
         """
 
         # compute estimate of the lower bound
-        self.greedy, self.best_lower_bound = self.get_new_query_point(
-            'greedy')
+        self.greedy, self.best_lower_bound = self.get_new_query_point('greedy')
 
-        # Run both swarm:
-        # Maximizers
+        # Run both swarms:
         x_maxi, val_maxi = self.get_new_query_point('maximizers')
-        # Expanders
         x_exp, val_exp = self.get_new_query_point('expanders')
 
         logging.info("The best maximizer has variance %f" % val_maxi)
@@ -1014,11 +1081,9 @@ class SafeOptSwarm(GaussianProcessOptimization):
                      self.best_lower_bound)
 
         if val_maxi > val_exp:
-            x = x_maxi
+            return x_maxi
         else:
-            x = x_exp
-        self.t += 1
-        return x
+            return x_exp
 
     def get_maximum(self):
         """
