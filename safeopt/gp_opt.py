@@ -45,13 +45,18 @@ class GaussianProcessOptimization(object):
     beta: float or callable
         A constant or a function of the time step that scales the confidence
         interval of the acquisition function.
+    threshold: float or list of floats
+        The algorithm will not try to expand any points that are below this
+        threshold. This makes the algorithm stop expanding points eventually.
+        If a list, this represents the stopping criterion for all the gps.
+        This ignores the scaling factor.
     scaling: list of floats or "auto"
         A list used to scale the GP uncertainties to compensate for
         different input sizes. This should be set to the maximal variance of each kernel.
         You should probably leave this to "auto" unless your kernel is non stationnary
     """
 
-    def __init__(self, gp, beta, num_contexts, scaling='auto'):
+    def __init__(self, gp, beta, num_contexts, threshold=0, scaling='auto'):
         super(GaussianProcessOptimization, self).__init__()
 
         if isinstance(gp, list):
@@ -77,6 +82,7 @@ class GaussianProcessOptimization(object):
                 raise ValueError("The number of scaling values should be "
                                  "equal to the number of GPs")
 
+        self.threshold = threshold
         self._parameter_set = None
         self.bounds = None
         self.num_samples = 0
@@ -219,9 +225,11 @@ class SafeOpt(GaussianProcessOptimization):
     beta: float or callable
         A constant or a function of the time step that scales the confidence
         interval of the acquisition function.
-    threshold: float
+    threshold: float or list of floats
         The algorithm will not try to expand any points that are below this
         threshold. This makes the algorithm stop expanding points eventually.
+        If a list, this represents the stopping criterion for all the gps.
+        This ignores the scaling factor.
     scaling: list of floats or "auto"
         A list used to scale the GP uncertainties to compensate for
         different input sizes. This should be set to the maximal variance of
@@ -232,7 +240,8 @@ class SafeOpt(GaussianProcessOptimization):
     def __init__(self, gp, parameter_set, fmin, lipschitz=None, beta=3.0,
                  num_contexts=0, threshold=0, scaling='auto'):
 
-        super(SafeOpt, self).__init__(gp, beta, num_contexts, scaling)
+        super(SafeOpt, self).__init__(gp, beta, num_contexts, threshold,
+                                      scaling)
 
         if self.num_contexts > 0:
             context_shape = (parameter_set.shape[0], self.num_contexts)
@@ -245,7 +254,6 @@ class SafeOpt(GaussianProcessOptimization):
 
         self.fmin = fmin
         self.liptschitz = lipschitz
-        self.threshold = threshold
 
         if not isinstance(self.fmin, list):
             self.fmin = [self.fmin] * len(self.gps)
@@ -420,7 +428,8 @@ class SafeOpt(GaussianProcessOptimization):
 
             # Remove points with a variance that is too small
             s[s] = (np.max((u[s, :] - l[s, :]) / self.scaling, axis=1) >
-                    max(max_var, self.threshold))
+                    max_var)
+            s[s] = np.any(u[s, :] - l[s, :] > self.threshold * beta, axis=1)
 
             if not np.any(s):
                 # no need to evaluate any points as expanders in G, exit
@@ -463,7 +472,7 @@ class SafeOpt(GaussianProcessOptimization):
                         break
             else:
                 # Check if expander for all GPs
-                for i in range(len(self.gps)):
+                for i, gp in enumerate(self.gps):
                     # Skip evlauation if 'no' safety constraint
                     if self.fmin[i] == -np.inf:
                         continue
@@ -472,14 +481,13 @@ class SafeOpt(GaussianProcessOptimization):
                     self.add_new_data_point(self.parameter_set[s, :][index, :],
                                             u[s, i][index],
                                             context=self.context,
-                                            gp=self.gps[i])
+                                            gp=gp)
 
                     # Prediction of previously unsafe points based on that
-                    mean2, var2 =\
-                        self.gps[i].predict_noiseless(self.inputs[~self.S])
+                    mean2, var2 = gp.predict_noiseless(self.inputs[~self.S])
 
                     # Remove the fake data point from the GP again
-                    self.remove_last_data_point(gp=self.gps[i])
+                    self.remove_last_data_point(gp=gp)
 
                     mean2 = mean2.squeeze()
                     var2 = var2.squeeze()
@@ -628,6 +636,11 @@ class SafeOptSwarm(GaussianProcessOptimization):
     beta: float or callable
         A constant or a function of the time step that scales the confidence
         interval of the acquisition function.
+    threshold: float or list of floats
+        The algorithm will not try to expand any points that are below this
+        threshold. This makes the algorithm stop expanding points eventually.
+        If a list, this represents the stopping criterion for all the gps.
+        This ignores the scaling factor.
     scaling: list of floats or "auto"
         A list used to scale the GP uncertainties to compensate for
         different input sizes. This should be set to the maximal variance of
@@ -659,9 +672,11 @@ class SafeOptSwarm(GaussianProcessOptimization):
 
     """
 
-    def __init__(self, gp, fmin, bounds, beta=3.0, scaling='auto',
+    def __init__(self, gp, fmin, bounds, beta=3.0, scaling='auto', threshold=0,
                  swarm_size=20):
-        super(SafeOptSwarm, self).__init__(gp, beta, num_contexts=0,
+        super(SafeOptSwarm, self).__init__(gp, beta,
+                                           num_contexts=0,
+                                           threshold=threshold,
                                            scaling=scaling)
 
         self.fmin = fmin
@@ -754,7 +769,7 @@ class SafeOptSwarm(GaussianProcessOptimization):
             A vector corresponding to how much the constraint was violated.
         scaling: float
             A float corresponding to the maximal variance of the corresponding
-            GP
+            GP.
         Returns
         -------
         penalties - ndarray
@@ -781,6 +796,7 @@ class SafeOptSwarm(GaussianProcessOptimization):
         swarm_type : string
             A string corresponding to the swarm type. It can be any of the
             following strings:
+
                 * 'greedy' : Optimal value(best lower bound).
                 * 'expander' : Expanders (lower bound close to constraint)
                 * 'maximizer' : Maximizers (Upper bound better than best l)
@@ -885,11 +901,13 @@ class SafeOptSwarm(GaussianProcessOptimization):
 
         This function relies on a Particle Swarm Optimization (PSO) to find the
         optimum of the objective function (which depends on the swarm type).
+
         Parameters
         ----------
         swarm_type: string
             This parameter controls the type of point that should be found. It
-            can take one of the following values
+            can take one of the following values:
+
                 * 'expanders' : find a point that increases the safe set
                 * 'maximizers' : find a point that maximizes the objective
                                  function within the safe set.
@@ -901,7 +919,7 @@ class SafeOptSwarm(GaussianProcessOptimization):
         global_best: np.array
             The next parameters that should be evaluated.
         max_std_dev: float
-            The current standard deviation in the point to be evaluated
+            The current standard deviation in the point to be evaluated.
         """
 
         beta = self.beta(self.t)
@@ -1049,18 +1067,20 @@ class SafeOptSwarm(GaussianProcessOptimization):
             return global_best, np.max(best_value)
 
         # compute the variance of the point picked
-        max_std_dev = 0.
-        for gp, scaling in zip(self.gps, self.scaling):
-            var = gp.predict_noiseless(global_best[None, :])[1]
-            max_std_dev = np.max(np.sqrt(var.squeeze()) / scaling, max_std_dev)
+        var = np.empty(len(self.gps), dtype=np.float)
+        # max_std_dev = 0.
+        for i, (gp, scaling) in enumerate(zip(self.gps, self.scaling)):
+            var[i] = gp.predict_noiseless(global_best[None, :])[1]
 
-        return global_best, max_std_dev
+        return global_best, np.sqrt(var)
 
-    def optimize(self):
+    def optimize(self, ucb=False):
         """Run Safe Bayesian optimization and get the next parameters.
 
         Parameters
         ----------
+        ucb: bool
+            Whether to only compute maximizers (best upper bound).
 
         Returns
         -------
@@ -1072,15 +1092,28 @@ class SafeOptSwarm(GaussianProcessOptimization):
         self.greedy, self.best_lower_bound = self.get_new_query_point('greedy')
 
         # Run both swarms:
-        x_maxi, val_maxi = self.get_new_query_point('maximizers')
-        x_exp, val_exp = self.get_new_query_point('expanders')
+        x_maxi, std_maxi = self.get_new_query_point('maximizers')
+        if ucb:
+            logging.info('Using ucb criterion.')
+            return x_maxi
 
-        logging.info("The best maximizer has variance %f" % val_maxi)
-        logging.info("The best expander has variance %f" % val_exp)
+        x_exp, std_exp = self.get_new_query_point('expanders')
+
+        # Remove expanders below threshold or without safety constraint.
+        std_exp[(std_exp < self.threshold) | (self.fmin == -np.inf)] = 0
+
+        # Apply scaling
+        std_exp /= self.scaling
+        std_exp = np.max(std_exp)
+
+        std_maxi = std_maxi[0] / self.scaling[0]
+
+        logging.info("The best maximizer has std. dev. %f" % std_maxi)
+        logging.info("The best expander has std. dev. %f" % std_exp)
         logging.info("The greedy estimate of lower bound has value %f" %
                      self.best_lower_bound)
 
-        if val_maxi > val_exp:
+        if std_maxi > std_exp:
             return x_maxi
         else:
             return x_exp
@@ -1094,9 +1127,9 @@ class SafeOptSwarm(GaussianProcessOptimization):
 
         Returns
         -------
-        x - ndarray
+        x : ndarray
             Location of the maximum
-        y - 0darray
+        y : 0darray
             Maximum value
 
         """
